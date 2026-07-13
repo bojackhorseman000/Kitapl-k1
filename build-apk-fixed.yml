@@ -1,0 +1,345 @@
+name: Native WebView TTS Hızlı Ayrı Sepet APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Keep APK signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: kelime-kartlari-debug-keystore-v1
+
+      - name: Build native WebView APK with TTS
+        run: |
+          set -eux
+          test -f index.html
+          rm -rf native-apk
+          mkdir -p native-apk/app/src/main/java/com/mete/kelimekartlari/nativewebtts
+          mkdir -p native-apk/app/src/main/assets
+          cp index.html native-apk/app/src/main/assets/index.html
+
+          cat > native-apk/settings.gradle <<'EOF2'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'KelimeKartlariNativeTTS'
+          include ':app'
+          EOF2
+
+          cat > native-apk/build.gradle <<'EOF2'
+          plugins {
+              id 'com.android.application' version '8.6.1' apply false
+          }
+          EOF2
+
+          cat > native-apk/app/build.gradle <<'EOF2'
+          plugins { id 'com.android.application' }
+
+          def runNumberText = System.getenv('GITHUB_RUN_NUMBER')
+          def appVersionCode = (runNumberText != null && runNumberText ==~ /\d+/) ? runNumberText.toInteger() : 4
+
+          android {
+              namespace 'com.mete.kelimekartlari.nativewebtts'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.mete.kelimekartlari.nativewebtts'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode = appVersionCode
+                  versionName = "1.4.${appVersionCode}"
+              }
+          }
+          EOF2
+
+          cat > native-apk/app/src/main/AndroidManifest.xml <<'EOF2'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:theme="@style/AppTheme"
+                  android:label="Kelime Kartları"
+                  android:hardwareAccelerated="true"
+                  android:usesCleartextTraffic="true"
+                  android:resizeableActivity="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="portrait"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF2
+
+          mkdir -p native-apk/app/src/main/res/values
+          cat > native-apk/app/src/main/res/values/styles.xml <<'EOF2'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowNoTitle">true</item>
+                  <item name="android:windowActionBar">false</item>
+                  <item name="android:windowFullscreen">false</item>
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:colorAccent">#f0d99c</item>
+                  <item name="android:navigationBarColor">#111724</item>
+                  <item name="android:statusBarColor">#111724</item>
+              </style>
+          </resources>
+          EOF2
+
+          cat > native-apk/app/src/main/java/com/mete/kelimekartlari/nativewebtts/MainActivity.java <<'EOF2'
+          package com.mete.kelimekartlari.nativewebtts;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.speech.tts.TextToSpeech;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.util.Locale;
+
+          public class MainActivity extends Activity {
+              private WebView webView;
+              private TextToSpeech tts;
+              private boolean ttsReady = false;
+              private SharedPreferences statePrefs;
+              private String pendingSpeak = null;
+              private ValueCallback<Uri[]> filePathCallback;
+              private String pendingExportText;
+              private static final int FILE_CHOOSER_REQUEST = 1201;
+              private static final int CREATE_DOCUMENT_REQUEST = 1202;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  statePrefs = getSharedPreferences("kelime_kartlari_state", MODE_PRIVATE);
+
+                  tts = new TextToSpeech(this, status -> {
+                      if (status == TextToSpeech.SUCCESS) {
+                          int result = tts.setLanguage(Locale.US);
+                          ttsReady = result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED;
+                          tts.setSpeechRate(0.88f);
+                          tts.setPitch(1.0f);
+                          if (ttsReady && pendingSpeak != null) {
+                              speakNative(pendingSpeak);
+                              pendingSpeak = null;
+                          }
+                      }
+                  });
+
+                  webView = new WebView(this);
+                  webView.setFocusable(true);
+                  webView.setFocusableInTouchMode(true);
+                  webView.requestFocusFromTouch();
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
+                  settings.setMediaPlaybackRequiresUserGesture(false);
+
+                  webView.addJavascriptInterface(new AndroidTTSBridge(), "AndroidTTS");
+                  webView.addJavascriptInterface(new AndroidStoreBridge(), "AndroidStore");
+                  webView.addJavascriptInterface(new AndroidFilesBridge(), "AndroidFiles");
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
+                          if (filePathCallback != null) filePathCallback.onReceiveValue(null);
+                          filePathCallback = callback;
+                          Intent intent;
+                          try {
+                              intent = params.createIntent();
+                              startActivityForResult(intent, FILE_CHOOSER_REQUEST);
+                              return true;
+                          } catch (Exception e) {
+                              filePathCallback = null;
+                              return false;
+                          }
+                      }
+                  });
+                  webView.setOnTouchListener(new View.OnTouchListener() {
+                      @Override
+                      public boolean onTouch(View v, MotionEvent event) {
+                          v.requestFocusFromTouch();
+                          return false;
+                      }
+                  });
+
+                  setContentView(webView);
+                  webView.loadUrl("file:///android_asset/index.html");
+              }
+
+              private void speakNative(String text) {
+                  if (text == null) return;
+                  String clean = text.trim();
+                  if (clean.length() == 0 || tts == null) return;
+
+                  if (!ttsReady) {
+                      pendingSpeak = clean;
+                      return;
+                  }
+
+                  tts.stop();
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                      tts.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "kelime_" + System.currentTimeMillis());
+                  } else {
+                      tts.speak(clean, TextToSpeech.QUEUE_FLUSH, null);
+                  }
+              }
+
+              public class AndroidTTSBridge {
+                  @JavascriptInterface
+                  public void speak(String text) {
+                      runOnUiThread(() -> speakNative(text));
+                  }
+
+                  @JavascriptInterface
+                  public boolean isReady() {
+                      return ttsReady;
+                  }
+              }
+
+
+              public class AndroidStoreBridge {
+                  @JavascriptInterface
+                  public String get(String key) {
+                      if (key == null || statePrefs == null) return null;
+                      return statePrefs.getString(key, null);
+                  }
+
+                  @JavascriptInterface
+                  public boolean set(String key, String value) {
+                      if (key == null || statePrefs == null) return false;
+                      statePrefs.edit().putString(key, value == null ? "" : value).apply();
+                      return true;
+                  }
+
+                  @JavascriptInterface
+                  public boolean remove(String key) {
+                      if (key == null || statePrefs == null) return false;
+                      statePrefs.edit().remove(key).apply();
+                      return true;
+                  }
+              }
+
+              public class AndroidFilesBridge {
+                  @JavascriptInterface
+                  public boolean saveText(String filename, String content, String mimeType) {
+                      if (content == null) return false;
+                      pendingExportText = content;
+                      runOnUiThread(() -> {
+                          Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                          intent.addCategory(Intent.CATEGORY_OPENABLE);
+                          intent.setType((mimeType == null || mimeType.trim().isEmpty()) ? "application/json" : mimeType);
+                          intent.putExtra(Intent.EXTRA_TITLE, (filename == null || filename.trim().isEmpty()) ? "kelime-kartlari-sepetler.json" : filename);
+                          try {
+                              startActivityForResult(intent, CREATE_DOCUMENT_REQUEST);
+                          } catch (Exception e) {
+                              pendingExportText = null;
+                          }
+                      });
+                      return true;
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+
+                  if (requestCode == FILE_CHOOSER_REQUEST) {
+                      Uri[] result = null;
+                      if (resultCode == RESULT_OK && data != null) {
+                          if (data.getClipData() != null) {
+                              int count = data.getClipData().getItemCount();
+                              result = new Uri[count];
+                              for (int i = 0; i < count; i++) result[i] = data.getClipData().getItemAt(i).getUri();
+                          } else if (data.getData() != null) {
+                              result = new Uri[]{data.getData()};
+                          }
+                      }
+                      if (filePathCallback != null) filePathCallback.onReceiveValue(result);
+                      filePathCallback = null;
+                      return;
+                  }
+
+                  if (requestCode == CREATE_DOCUMENT_REQUEST) {
+                      if (resultCode == RESULT_OK && data != null && data.getData() != null && pendingExportText != null) {
+                          try (OutputStream stream = getContentResolver().openOutputStream(data.getData())) {
+                              if (stream != null) {
+                                  stream.write(pendingExportText.getBytes(StandardCharsets.UTF_8));
+                                  stream.flush();
+                              }
+                          } catch (Exception ignored) { }
+                      }
+                      pendingExportText = null;
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (tts != null) {
+                      tts.stop();
+                      tts.shutdown();
+                  }
+                  if (webView != null) {
+                      webView.destroy();
+                  }
+                  super.onDestroy();
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          EOF2
+
+          cd native-apk
+          gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kelime-kartlari-hizli-ayri-sepet-apk
+          path: native-apk/app/build/outputs/apk/debug/app-debug.apk
